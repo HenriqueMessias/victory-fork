@@ -46,6 +46,16 @@
 //! with a 64 MB file written past the system's cache, mapped and replaced:
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
+//!
+//! Nothing can be taken out of a library, and a pipeline whose translation
+//! or graphics state changed has another name, so every change of the
+//! translator left its pipelines' old forms in the file for good. A file
+//! past [`limit`] is therefore not added to: the run starts an empty
+//! library, takes each pipeline it wants from the old one ([`Library::old`])
+//! and stores it in the new one, which replaces the file. Pipelines no run
+//! asks for stay behind; those of the early list are asked for while the
+//! title loads, whatever it does afterwards, and nothing carried over is
+//! compiled again.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -394,7 +404,11 @@ pub(crate) fn trim() {
 
 struct Library {
     library: ID3D12PipelineLibrary1,
-    /// The blob the library was made from: it must outlive the library.
+    /// The library of a file past [`limit`]: pipelines are taken from it,
+    /// none are stored in it. Before the blob, which it must not outlive.
+    old: Option<ID3D12PipelineLibrary1>,
+    /// The blob the library (or the old one) was made from: it must outlive
+    /// that library.
     _blob: Blob,
     /// Pipelines stored since the last save.
     added: AtomicU64,
@@ -428,6 +442,30 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
         .then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// The size past which the library's file is made anew with the pipelines
+/// in use (see the module's notes): 2 GiB, above the 1.5 GB largest seen in
+/// use. `VICTORY_LIBRARY_MAX_MB=<n>` sets another; `0`: none, as before.
+/// shortcut: pipelines in use that pass the limit by themselves are carried
+/// over again at every start; raise it then.
+fn limit() -> Option<u64> {
+    static LIMIT: OnceLock<Option<u64>> = OnceLock::new();
+    *LIMIT.get_or_init(|| parse_limit(std::env::var("VICTORY_LIBRARY_MAX_MB").ok().as_deref()))
+}
+
+/// `VICTORY_LIBRARY_MAX_MB`'s value in bytes; the default when it is unset
+/// or unreadable. Pure, for testing.
+fn parse_limit(value: Option<&str>) -> Option<u64> {
+    const DEFAULT_MB: u64 = 2048;
+    let mb = value.and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_MB);
+    (mb > 0).then(|| mb.saturating_mul(1 << 20))
+}
+
+/// How long a run that makes the file anew leaves the old one in place (the
+/// save at its end included): a save replaces all of it, and a run that ends
+/// before the title has asked for its pipelines would leave the next one to
+/// compile the rest. Such a run keeps nothing, and the next one tries again.
+const CARRY_FOR: std::time::Duration = std::time::Duration::from_secs(180);
+
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// A saved library that could not replace [`LIBRARY_FILE`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
@@ -437,13 +475,17 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
+/// When the library was opened.
+static OPENED: OnceLock<std::time::Instant> = OnceLock::new();
+
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
-            let library = open(&device, blob);
+            let _ = OPENED.set(std::time::Instant::now());
+            let library = open(&device, blob, limit());
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
@@ -453,8 +495,9 @@ fn library() -> Option<&'static Library> {
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
-/// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
+/// adapter or driver change, damage) or it is larger than `limit` (the
+/// library in it is then the old one).
+fn open(device: &ID3D12Device1, blob: Blob, limit: Option<u64>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
@@ -472,8 +515,27 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
                     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
                 }
+                let (library, old) = if limit.is_some_and(|l| bytes as u64 > l) {
+                    match make(&[]) {
+                        Ok(empty) => {
+                            tracing::info!(
+                                bytes,
+                                limit,
+                                "host pipeline library past its limit (VICTORY_LIBRARY_MAX_MB): made anew with the pipelines in use"
+                            );
+                            (empty, Some(library))
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "no new host pipeline library; the large one is kept");
+                            (library, None)
+                        }
+                    }
+                } else {
+                    (library, None)
+                };
                 return Some(Library {
                     library,
+                    old,
                     _blob: blob,
                     added: AtomicU64::new(0),
                     saving: RwLock::new(()),
@@ -490,6 +552,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let library = make(&[]).ok()?;
     Some(Library {
         library,
+        old: None,
         _blob: Blob::None,
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
@@ -508,10 +571,11 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 }
 
 /// The pipeline named `name`: loaded from the library by `load` if it is
-/// there with the same description, else made by `create` and stored.
+/// there with the same description (or from the old one, and then stored),
+/// else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
@@ -520,11 +584,15 @@ pub(crate) fn pipeline(
         return create();
     };
     let began = std::time::Instant::now();
-    let loaded = {
+    let (loaded, carried) = {
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
-        load(&library.library, PCWSTR(wide.as_ptr()))
+        let name = PCWSTR(wide.as_ptr());
+        match (load(&library.library, name), &library.old) {
+            (Err(_), Some(old)) => (load(old, name), true),
+            (loaded, _) => (loaded, false),
+        }
     };
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
@@ -536,6 +604,9 @@ pub(crate) fn pipeline(
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
             });
+            if carried {
+                store(library, name, &wide, &pso);
+            }
             return Ok(pso);
         }
         Err(e) => e,
@@ -553,15 +624,20 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
+    store(library, name, &wide, &pso);
+    Ok(pso)
+}
+
+/// Puts the pipeline `name` into the library, for the next save.
+fn store(library: &Library, name: &str, wide: &HSTRING, pso: &ID3D12PipelineState) {
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
-    Ok(pso)
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -572,6 +648,9 @@ pub(crate) fn save(now: bool) {
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if library.old.is_some() && OPENED.get().is_some_and(|t| t.elapsed() < CARRY_FOR) {
+            return;
+        }
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
             return;
         }
@@ -665,9 +744,20 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// the mapping goes on reading the old one for as long as a handle on it
 /// is open ([`holds`]; with none, only the pages in memory at that moment
 /// stay: the rest read as zeros). Where a system refuses, the new library
-/// is left beside it as [`NEXT_FILE`] for the next start.
+/// is left beside it as [`NEXT_FILE`] for the next start. One an earlier
+/// save left there goes when this one is in place: the next start would
+/// rename it over this newer one.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    let next = dir.join(NEXT_FILE);
+    if std::fs::rename(tmp, dir.join(LIBRARY_FILE)).is_err() {
+        return std::fs::rename(tmp, next);
+    }
+    if let Err(e) = std::fs::remove_file(next)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(error = %e, "an older host pipeline library is left to replace this one at the next start");
+    }
+    Ok(())
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -731,10 +821,54 @@ mod tests {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
-        let library = open(&device, Blob::Held(b"not a pipeline library".repeat(16))).expect("an empty library");
+        let library = open(&device, Blob::Held(b"not a pipeline library".repeat(16)), None).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(matches!(library._blob, Blob::None));
+    }
+
+    #[test]
+    fn the_limit_parses_or_falls_back() {
+        assert_eq!(parse_limit(None), Some(2 << 30));
+        assert_eq!(parse_limit(Some(" 512 ")), Some(512 << 20));
+        assert_eq!(parse_limit(Some("0")), None);
+        for bad in ["", "-1", "lots"] {
+            assert_eq!(parse_limit(Some(bad)), Some(2 << 30), "{bad:?}");
+        }
+        assert_eq!(parse_limit(Some("18446744073709551615")), Some(u64::MAX));
+    }
+
+    /// A library past the limit is kept beside a new one; one at it is used.
+    #[test]
+    fn a_library_past_the_limit_is_made_anew() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let empty = open(&device, Blob::None, None).expect("an empty library");
+        // SAFETY: a live library, and a buffer of the size it asks for.
+        let bytes = unsafe {
+            let mut bytes = vec![0u8; empty.library.GetSerializedSize()];
+            empty.library.Serialize(&mut bytes).unwrap();
+            bytes
+        };
+        let size = bytes.len() as u64;
+        for (limit, anew) in [(None, false), (Some(size), false), (Some(size - 1), true)] {
+            let library = open(&device, Blob::Held(bytes.clone()), limit).expect("a library");
+            assert_eq!(library.old.is_some(), anew, "{limit:?}");
+            assert!(matches!(library._blob, Blob::Held(_)), "kept for the library made from it");
+        }
+    }
+
+    /// A library an earlier save left beside the file does not come back
+    /// over the one a later save put in place.
+    #[test]
+    fn a_save_in_place_ends_the_one_that_waited() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("new.tmp");
+        std::fs::write(dir.path().join(NEXT_FILE), b"older").unwrap();
+        std::fs::write(&tmp, b"newer").unwrap();
+        replace_library(dir.path(), &tmp).unwrap();
+        assert_eq!(Blob::of(dir.path()).bytes(), b"newer");
     }
 
     /// A mapped file reads as the file's bytes, a file written through a
