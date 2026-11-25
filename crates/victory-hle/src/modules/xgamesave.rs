@@ -8,7 +8,10 @@
 //! from the previous version), flushed to disk, and one directory rename
 //! commits it (`v<N>`); the highest committed version is the container.
 //! A crash leaves the old version or the new one, never a mix; leftovers
-//! are removed on sight. Deleting a container renames it away first.
+//! are removed on sight, an older version only once a newer one has been
+//! read. A version whose files are damaged is set aside (`v<N>.bad<i>`,
+//! never removed) if an older one is whole. Deleting a container renames it
+//! away first.
 //!
 //! Names are exact: a version's `manifest` holds the container's name, its
 //! display name and the blob names (blob `i` is the file `i`), so case,
@@ -177,11 +180,40 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
+/// Committed version `number` of the container in `dir`. `InvalidData` if
+/// its files are damaged (a manifest or a blob is missing, or the manifest
+/// does not parse); any other error may pass (a file another program holds).
+fn load(dir: &Path, number: u64) -> std::io::Result<Version> {
+    let version = dir.join(format!("v{number}"));
+    let bad = |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad save: {what}"));
+    let gone = |e: std::io::Error, what: &str| match e.kind() {
+        std::io::ErrorKind::NotFound => bad(what),
+        _ => e,
+    };
+    let bytes = std::fs::read(version.join(MANIFEST)).map_err(|e| gone(e, "no manifest"))?;
+    let mut names = parse_manifest(&bytes).ok_or_else(|| bad("manifest"))?;
+    let blobs = names.split_off(2);
+    let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad("manifest"))?;
+    let version = Version {
+        dir: version,
+        number,
+        name,
+        display,
+        blobs,
+    };
+    for i in 0..version.blobs.len() {
+        std::fs::metadata(version.blob(i)).map_err(|e| gone(e, "a blob is missing"))?;
+    }
+    Ok(version)
+}
+
 /// The container's newest committed version, if any. Removes what a crash
-/// left: unfinished versions and older ones.
+/// left: unfinished versions, and older ones once a newer one was read.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
-    for entry in std::fs::read_dir(dir)?.flatten() {
+    for entry in std::fs::read_dir(dir)? {
+        // A version that is not seen would pass for one that is not there.
+        let entry = entry?;
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
@@ -190,25 +222,41 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
             committed.push(n);
         }
     }
-    committed.sort_unstable();
-    let Some(&number) = committed.last() else {
-        return Ok(None);
-    };
-    for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+    committed.sort_unstable_by(|a, b| b.cmp(a));
+    let mut damaged = None;
+    for (i, &number) in committed.iter().enumerate() {
+        let version = match load(dir, number) {
+            Ok(version) => version,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                tracing::warn!(dir = %dir.display(), number, %e, "game save version");
+                damaged = Some(e);
+                continue;
+            }
+            // It may be whole: nothing is decided without it.
+            Err(e) => return Err(e),
+        };
+        // The damaged ones above it, out of the way of the next commit.
+        for bad in &committed[..i] {
+            set_aside(dir, *bad)?;
+        }
+        for old in &committed[i + 1..] {
+            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+        }
+        return Ok(Some(version));
     }
-    let version = dir.join(format!("v{number}"));
-    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
-    let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
-    let blobs = names.split_off(2);
-    let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
-    Ok(Some(Version {
-        dir: version,
-        number,
-        name,
-        display,
-        blobs,
-    }))
+    // Every version is damaged: all are left as they are.
+    damaged.map_or(Ok(None), Err)
+}
+
+/// Renames a damaged version so that it no longer counts as committed.
+fn set_aside(dir: &Path, number: u64) -> std::io::Result<()> {
+    let free = (0u32..)
+        .map(|i| dir.join(format!("v{number}.bad{i}")))
+        .find(|p| !p.exists());
+    let to = free.expect("a free name");
+    std::fs::rename(dir.join(format!("v{number}")), &to)?;
+    tracing::warn!(kept = %to.display(), "damaged game save version set aside; an older one is used");
+    Ok(())
 }
 
 /// The version of container `name` in `dir`; none for a missing container
@@ -282,8 +330,10 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
         if file.ends_with(".gone") {
             let _ = std::fs::remove_dir_all(&path);
         } else if file.contains('~') {
-            if let Ok(Some(v)) = current(&path) {
-                out.push((v.name, path));
+            match current(&path) {
+                Ok(Some(v)) => out.push((v.name, path)),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(dir = %path.display(), %e, "game save not listed"),
             }
         } else if let Some(name) = decode(&file)
             && let Some(dir) = migrate(root, &name, &path)
@@ -296,30 +346,52 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// Moves a container of the old layout (blob files named by encoded name,
-/// a `.display` file) into a committed version, then removes it.
+/// a `.display` file) into a committed version, then removes it. If any of
+/// it cannot be read it stays as it is, for the next time.
 fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
+    let moved = try_migrate(root, name, old);
+    moved
+        .inspect_err(|e| tracing::warn!(container = name, %e, "game save of the old layout not moved"))
+        .ok()
+}
+
+fn try_migrate(root: &Path, name: &str, old: &Path) -> std::io::Result<PathBuf> {
     let dir = container_dir(root, name);
-    let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
+    let done = current_named(&dir, name)?.is_some(); // a crash after the commit
     if !done {
-        let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
+        let display = match std::fs::read_to_string(old.join(".display")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            read => read?,
+        };
+        let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in std::fs::read_dir(old)? {
+            let entry = entry?;
+            if let Some(blob) = entry.file_name().to_str().and_then(decode) {
+                blobs.push((blob, std::fs::read(entry.path())?));
+            }
+        }
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
             .map(|(n, d)| (n.as_str(), Source::Data(d)))
             .collect();
-        commit(&dir, 1, name, &display, &sources).ok()?;
+        commit(&dir, 1, name, &display, &sources)?;
+        load(&dir, 1)?; // the only copy goes next
     }
-    std::fs::remove_dir_all(old).ok()?;
+    std::fs::remove_dir_all(old)?;
     tracing::info!(container = name, "game save moved to the versioned layout");
-    Some(dir)
+    Ok(dir)
+}
+
+/// Whether container `name` is still there in the old layout after moving
+/// what can be moved. A new version beside it would pass for the moved one,
+/// and the old one would be removed unread.
+fn unmoved(root: &Path, name: &str) -> bool {
+    containers(root); // moves them
+    let entries = std::fs::read_dir(root).into_iter().flatten().flatten();
+    entries
+        .filter(|e| e.path().is_dir())
+        .any(|e| e.file_name().to_str().and_then(decode).as_deref() == Some(name))
 }
 
 fn used_bytes(root: &Path) -> u64 {
@@ -424,6 +496,10 @@ impl Update {
     /// Applies the update as one new version of the container.
     fn submit(&self) -> HRESULT {
         let _saves = saves_lock();
+        let root = self.dir.parent().unwrap_or(&self.dir);
+        if unmoved(root, &self.name) {
+            return NO_ACCESS;
+        }
         let current = match current(&self.dir) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -463,7 +539,6 @@ impl Update {
             let changed = sizes.iter().filter(|(n, _)| self.changes.iter().any(|(c, _)| c == n));
             changed.map(|(_, size)| size).sum()
         });
-        let root = self.dir.parent().unwrap_or(&self.dir);
         let free = storage::disk_free(root);
         if let Some(hr) = no_room(written as u64, replaced, used_bytes(root), free) {
             return hr;
@@ -472,6 +547,10 @@ impl Update {
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
         let number = current.as_ref().map_or(1, |v| v.number + 1);
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
+            return io_error(&self.dir, &e);
+        }
+        // The new version, read back; until then the old one is kept.
+        if let Err(e) = load(&self.dir, number) {
             return io_error(&self.dir, &e);
         }
         // The old version is garbage now; a crash here leaves it for later.
@@ -487,6 +566,9 @@ impl Update {
 fn delete(root: &Path, name: &str) -> HRESULT {
     let _saves = saves_lock();
     let dir = container_dir(root, name);
+    if unmoved(root, name) {
+        return NO_ACCESS;
+    }
     match current_named(&dir, name) {
         Ok(Some(_)) => {}
         Ok(None) => return S_OK,
@@ -1141,6 +1223,69 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+    }
+
+    /// A blob of the old layout that cannot be read (here: a folder in its
+    /// place) leaves the whole container where it is, and nothing is written
+    /// or deleted beside it; once it can be read, all of it moves.
+    #[test]
+    fn an_unreadable_old_container_is_not_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let old = root.join("Slot");
+        std::fs::create_dir_all(old.join("b")).unwrap();
+        std::fs::write(old.join("a"), b"old a").unwrap();
+        std::fs::write(old.join(".display"), b"one").unwrap();
+
+        assert!(containers(root).is_empty());
+        assert_eq!(update(root, "two", &[("a", Some("new"))]), NO_ACCESS);
+        assert_eq!(delete(root, "Slot"), NO_ACCESS);
+        assert_eq!(std::fs::read(old.join("a")).unwrap(), b"old a");
+        assert!(old.join("b").is_dir());
+        // Other containers go on.
+        assert_eq!(delete(root, "Other"), S_OK);
+
+        std::fs::remove_dir(old.join("b")).unwrap();
+        std::fs::write(old.join("b"), b"old b").unwrap();
+        assert_eq!(containers(root).len(), 1);
+        assert!(!old.exists());
+        assert_eq!(state(root), old_state());
+    }
+
+    /// A damaged newest version is set aside, not removed, for the older one
+    /// a crash left; with no whole version nothing is touched.
+    #[test]
+    fn older_versions_stay_until_a_newer_one_is_read() {
+        type Damage = fn(&Path);
+        let damages: [Damage; 4] = [
+            |v| std::fs::remove_file(v.join(MANIFEST)).unwrap(),
+            |v| std::fs::write(v.join(MANIFEST), b"").unwrap(),
+            |v| std::fs::write(v.join(MANIFEST), [0xff; 64]).unwrap(),
+            |v| std::fs::remove_file(v.join("0")).unwrap(),
+        ];
+        for damage in damages {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let slot = container_dir(root, "Slot");
+            let commit = |number, display, data: &[u8]| {
+                commit(&slot, number, "Slot", display, &[("a", Source::Data(data))]).unwrap();
+            };
+            commit(1, "one", b"old a");
+            commit(2, "two", b"new a");
+            damage(&slot.join("v2"));
+            let one = Some(("one".into(), vec![("a".into(), "old a".into())]));
+            assert_eq!(state(root), one);
+            assert!(slot.join("v2.bad0").is_dir(), "kept");
+            // The next version takes the number; damaged again, both are kept.
+            assert_eq!(update(root, "three", &[("a", Some("a 3"))]), S_OK);
+            assert_eq!(state(root), Some(("three".into(), vec![("a".into(), "a 3".into())])));
+            assert!(!slot.join("v1").exists());
+            damage(&slot.join("v2"));
+            assert!(current(&slot).is_err());
+            assert_eq!(update(root, "four", &[("a", Some("a 4"))]), NO_ACCESS);
+            assert_eq!(delete(root, "Slot"), NO_ACCESS);
+            assert!(slot.join("v2").is_dir() && slot.join("v2.bad0").is_dir());
+        }
     }
 
     /// An empty configuration id names none. As a folder name it would be
