@@ -114,7 +114,8 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
     }
     match (*code.get(i + 1)?, code.get(i + 2).copied()) {
         (0x01, Some(0xFC)) => {
-            // clzero (0F 01 FC); add rax, 0x40 (48 83 C0 40); cmp rax, <reg> ([48|4C] 39 modrm); jb -12 (72 F4)
+            // clzero (0F 01 FC); add rax, 0x40 (48 83 C0 40); cmp rax, <reg> ([48|4C] 39 modrm, rax
+            // in r/m); jb -12 (72 F4)
             // (not after an 0x67: that CLZERO is at EAX, and the jb goes back to the 0F, past the
             // prefix – it is stepped alone, the loop is taken from the next one)
             if code.len() >= i + 12
@@ -122,6 +123,7 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
                 && code[i + 3..i + 7] == [0x48, 0x83, 0xC0, 0x40]
                 && (code[i + 7] == 0x48 || code[i + 7] == 0x4C)
                 && code[i + 8] == 0x39
+                && code[i + 9] & 0xC7 == 0xC0
                 && code[i + 10..i + 12] == [0x72, 0xF4]
             {
                 let rex_r = code[i + 7] == 0x4C;
@@ -159,10 +161,110 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
     }
 }
 
+/// The second opcode byte of `clwb` (`66 0F AE /6`) and of the NOP it is made by changing that
+/// byte alone (`66 0F 1F /6`, the same operand, so the same length). A write of one byte is
+/// seen whole or not at all, wherever the instruction lies: another processor fetches the one
+/// instruction or the other. With NOPs written over its 4 and more bytes another processor
+/// could fetch some of them: after a `90` in place of the `66` the rest is `xsaveopt`, which
+/// stores the processor's state where the `clwb` pointed (265 bytes changed on a Haswell).
+pub const CLWB_OPCODE: u8 = 0xAE;
+pub const NOP_OPCODE: u8 = 0x1F;
+
+/// Where the second opcode byte of the instruction at the start of `code` is, if it is a
+/// `clwb` or the NOP made of one (no prefix is an `0F`).
+pub fn clwb_opcode(code: &[u8]) -> Option<usize> {
+    let at = code.iter().position(|&b| b == 0x0F)? + 1;
+    matches!(code.get(at), Some(&CLWB_OPCODE | &NOP_OPCODE)).then_some(at)
+}
+
+/// The length of the NOP made of a `clwb` at the start of `code`: what a thread finds that
+/// faulted on the `clwb` just before another one changed it.
+pub fn clwb_made_nop(code: &[u8]) -> Option<usize> {
+    let at = clwb_opcode(code).filter(|&at| code[at] == NOP_OPCODE)?;
+    // As long as any instruction; no heap, in an exception handler.
+    let mut was = [0u8; 16];
+    let n = code.len().min(was.len());
+    was[..n].copy_from_slice(&code[..n]);
+    *was.get_mut(at)? = CLWB_OPCODE;
+    match decode(&was[..n]) {
+        Some((ConsoleOnly::Clwb, len)) => Some(len),
+        _ => None,
+    }
+}
+
+/// The passes of a `clzero` loop from `start` ([`ConsoleOnly::ClzeroLoop`]): its test comes
+/// last, so there is one whatever `end` is.
+pub fn clzero_passes(start: u64, end: u64) -> u64 {
+    end.saturating_sub(start).div_ceil(64).max(1)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every form of `clwb` is told from the NOP made of it, whose length is the same; no
+    /// other instruction passes for one.
+    #[test]
+    fn a_clwb_and_the_nop_made_of_it() {
+        let forms: [&[u8]; 7] = [
+            &[0x66, 0x0F, 0xAE, 0x30],
+            &[0x66, 0x0F, 0xAE, 0x71, 0x40],
+            &[0x66, 0x0F, 0xAE, 0x74, 0x24, 0x08],
+            &[0x66, 0x0F, 0xAE, 0x35, 1, 2, 3, 4],
+            &[0x66, 0x41, 0x0F, 0xAE, 0x30],
+            &[0x66, 0x67, 0x0F, 0xAE, 0x30],
+            // a displacement with both opcode bytes in it
+            &[0x66, 0x0F, 0xAE, 0xB0, 0x0F, 0xAE, 0x0F, 0x1F],
+        ];
+        for form in forms {
+            // What follows it is of no account.
+            let mut code = [form, &[0x0F, 0xAE, 0x30, 0x66, 0xCC]].concat();
+            assert_eq!(decode(&code), Some((ConsoleOnly::Clwb, form.len())));
+            assert_eq!(clwb_made_nop(&code), None);
+            let at = clwb_opcode(&code).unwrap();
+            code[at] = NOP_OPCODE;
+            assert_eq!(decode(&code), None, "{code:02x?}");
+            assert_eq!(clwb_made_nop(&code), Some(form.len()), "{code:02x?}");
+            assert_eq!(clwb_opcode(&code), Some(at));
+        }
+        // a compiler's NOP (/0), one without 66, NOPs, a cut-off one, clflushopt, nothing
+        let others: [&[u8]; 6] =
+            [&[0x66, 0x0F, 0x1F, 0x00], &[0x0F, 0x1F, 0x30], &[0x90; 4], &[0x66, 0x0F, 0x1F], &[0x66, 0x0F, 0xAE, 0x38], &[]];
+        for other in others {
+            assert_eq!(clwb_made_nop(other), None, "{other:02x?}");
+        }
+    }
+
+    /// Against the loop's own instructions, pass by pass.
+    #[test]
+    fn clzero_loops_pass_as_often_as_the_instructions() {
+        for start in [0u64, 5, 64, 4096] {
+            for end in [0u64, 1, 5, 63, 64, 65, 69, 128, 4096, 4097, 4160, 10_000] {
+                let (mut rax, mut passes) = (start, 0);
+                loop {
+                    passes += 1;
+                    rax += 64;
+                    if rax >= end {
+                        break;
+                    }
+                }
+                assert_eq!(clzero_passes(start, end), passes, "{start}..{end}");
+            }
+        }
+        assert_eq!(clzero_passes(0, 6 << 30), (6 << 30) / 64);
+        assert_eq!(clzero_passes(u64::MAX, 0), 1);
+        assert_eq!(clzero_passes(0, u64::MAX), 1 << 58);
+    }
+
+    /// A loop whose `cmp` is not of `rax` (a register or memory in its place) is taken one
+    /// `clzero` at a time.
+    #[test]
+    fn a_loop_that_compares_something_else_is_not_taken_whole() {
+        for modrm in [0xD1, 0x10, 0x50] {
+            let code = [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, modrm, 0x72, 0xF4];
+            assert_eq!(decode(&code), Some((ConsoleOnly::Clzero, 3)), "{modrm:#x}");
+        }
+    }
 
     /// EXTRQ / INSERTQ as AMD's manual gives them: a length of 0 is 64.
     #[test]

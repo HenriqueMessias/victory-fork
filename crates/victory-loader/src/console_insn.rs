@@ -3,14 +3,15 @@
 //! its first frames), and the vectored handler steps over them here.
 //!
 //! Ported from XCL (github.com/ivall/xcl, GPL-2.0-only): `insn.rs` (decoder, as
-//! `console_insn_decode.rs`, unchanged) and `eh.rs` `emulate_console_only`.
+//! `console_insn_decode.rs`) and `eh.rs` `emulate_console_only`. Changed here: how a `clwb` is
+//! patched ([`patch_clwb`]) and what a `clzero` loop leaves behind ([`clzero_loop`]).
 
 #[path = "console_insn_decode.rs"]
 mod decode;
 
 use decode::ConsoleOnly;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 
 const CONTINUE_EXECUTION: i32 = -1;
@@ -97,6 +98,72 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     Some(to.min(end))
 }
 
+/// Makes the `clwb` whose second opcode byte is at `at` a NOP ([`decode::NOP_OPCODE`]): there is
+/// nothing to write back on the PC, and no exception next time. Other threads may be running
+/// the instruction, so that byte alone is written. One thread patches at a time: two of them
+/// changing one page's protection left it writable, or took the write away from under the
+/// other (a fault inside the handler). A thread that finds another one at it leaves the
+/// instruction for its next time.
+///
+/// # Safety
+/// `at` is inside mapped code.
+unsafe fn patch_clwb(at: usize) {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let Ok(_one) = PATCHING.try_lock() else { return };
+    let mut old = 0u32;
+    // SAFETY: one byte of code, made writable for the patch and restored; only patches write
+    // code while the title runs, one at a time.
+    unsafe {
+        let opcode = AtomicU8::from_ptr(at as *mut u8);
+        if opcode.load(SeqCst) == decode::CLWB_OPCODE && VirtualProtect(at as *const _, 1, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+            opcode.store(decode::NOP_OPCODE, SeqCst);
+            VirtualProtect(at as *const _, 1, old, &mut old);
+            FlushInstructionCache(GetCurrentProcess(), at as *const _, 1);
+        }
+    }
+}
+
+/// The whole `clzero; add rax,40h; cmp rax,end; jb` loop at once, as its instructions leave
+/// memory, `rax` and the flags: whole lines, however `rax` lies in its own, and the first
+/// without a test. False if it is not over: at the first line that cannot be written (`rax`
+/// is then there, and the real one faults there too).
+///
+/// Region by region: a block may lie across several (the title's pages are mapped one view
+/// each), and one answer for all of it was a refusal, after which every 64-byte line took an
+/// exception of its own.
+///
+/// # Safety
+/// As [`emulate`], for a `ClzeroLoop` at `ctx.Rip`.
+unsafe fn clzero_loop(ctx: &mut CONTEXT, end_reg: u8) -> bool {
+    let start = ctx.Rax;
+    let first = start & !63;
+    let end = *crate::crash::gpr(ctx, end_reg);
+    let passes = decode::clzero_passes(start, end);
+    // Past the end of the address space nothing is writable.
+    let stop = passes.saturating_mul(64).saturating_add(first) & !63;
+    let mut at = first as usize;
+    while at < stop as usize {
+        let Some(to) = writable_to(at, stop as usize) else { break };
+        // SAFETY: committed and writable from `at` to `to`.
+        unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
+        at = to;
+    }
+    let zeroed = at as u64 - first;
+    ZEROED.fetch_add(zeroed, Relaxed);
+    // Regions and lines end on lines: whole passes.
+    ctx.Rax = start.wrapping_add(zeroed);
+    if zeroed / 64 < passes {
+        return false;
+    }
+    // (`cmp rax, rax` compares what the loop left there.)
+    let end = *crate::crash::gpr(ctx, end_reg);
+    ctx.EFlags = ctx.EFlags & !crate::crash::CMP_FLAGS | crate::crash::cmp_flags(ctx.Rax, end);
+    true
+}
+
 /// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
 /// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
 /// see it).
@@ -123,9 +190,19 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             n
         }
     };
-    // SAFETY: `n` bytes at `rip` are readable.
-    let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
-    let Some((what, len)) = decode::decode(code) else { return 0 };
+    // A copy: another thread may be patching the instruction.
+    let mut code = [0u8; 16];
+    for (i, b) in code[..n].iter_mut().enumerate() {
+        // SAFETY: `n` bytes at `rip` are readable.
+        *b = unsafe { (rip as *const u8).add(i).read_volatile() };
+    }
+    let code = &code[..n];
+    let Some((what, len)) = decode::decode(code) else {
+        // A `clwb` another thread made a NOP since this one faulted on it.
+        let Some(len) = decode::clwb_made_nop(code) else { return 0 };
+        ctx.Rip += len as u64;
+        return CONTINUE_EXECUTION;
+    };
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock()
         && !seen.contains(&std::mem::discriminant(&what))
@@ -138,15 +215,9 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     match what {
         ConsoleOnly::Ud2 => return 0,
         ConsoleOnly::Clwb => {
-            // nothing to write back on the PC: patched to NOPs, no exception next time
-            use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-            let mut old = 0u32;
-            // SAFETY: the instruction's own bytes, made writable for the patch and restored.
-            unsafe {
-                if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
-                    std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
-                    VirtualProtect(rip as *const _, len, old, &mut old);
-                }
+            if let Some(at) = decode::clwb_opcode(code) {
+                // SAFETY: inside the instruction that faulted.
+                unsafe { patch_clwb(rip + at) };
             }
         }
         ConsoleOnly::Monitorx => {}
@@ -162,35 +233,16 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
         }
         ConsoleOnly::ClzeroLoop { end_reg } => {
-            // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once
-            let regs: [u64; 16] = [
-                ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
-            ];
-            let end = regs[end_reg as usize & 15] as usize;
-            let start = ctx.Rax as usize;
-            if end > start && end - start < 2 << 30 {
-                // Region by region: a block may lie across several (the title's pages are
-                // mapped one view each), and one answer for all of it was a refusal, after
-                // which every 64-byte line took an exception of its own.
-                let mut at = start;
-                while at < end {
-                    let Some(to) = writable_to(at, end) else { break };
-                    // SAFETY: committed and writable from `at` to `to`.
-                    unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
-                    at = to;
-                }
-                if at == start {
+            let start = ctx.Rax;
+            // SAFETY: the loop at `rip`.
+            if !unsafe { clzero_loop(ctx, end_reg) } {
+                if ctx.Rax == start {
                     return 0;
                 }
-                ZEROED.fetch_add((at - start) as u64, Relaxed);
-                if at < end {
-                    // What follows is not writable: the loop goes on there (the same
-                    // instruction again), where the real one faults too.
-                    ctx.Rax = at as u64;
-                    return CONTINUE_EXECUTION;
-                }
+                // The loop goes on at the line that is not writable (the same instruction
+                // again).
+                return CONTINUE_EXECUTION;
             }
-            ctx.Rax = end as u64;
         }
         ConsoleOnly::Rdpru => {
             let mut v = 0i64;
@@ -246,4 +298,161 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         );
     }
     CONTINUE_EXECUTION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree, VirtualProtect, VirtualQuery,
+    };
+
+    /// Fresh pages; freed at the end.
+    struct Pages(usize, usize);
+    impl Pages {
+        fn new(len: usize) -> Pages {
+            // SAFETY: a fresh allocation.
+            let at = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+            assert!(!at.is_null());
+            Pages(at as usize, len)
+        }
+        fn bytes(&mut self) -> &mut [u8] {
+            // SAFETY: ours, committed.
+            unsafe { std::slice::from_raw_parts_mut(self.0 as *mut u8, self.1) }
+        }
+        fn protect(&self, at: usize, len: usize, protect: u32) {
+            let mut old = 0;
+            // SAFETY: our pages.
+            assert_ne!(unsafe { VirtualProtect((self.0 + at) as *const _, len, protect, &mut old) }, 0);
+        }
+        fn protection(&self) -> u32 {
+            // SAFETY: plain data filled in by the query.
+            unsafe {
+                let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_ne!(VirtualQuery(self.0 as *const _, &mut m, size_of_val(&m)), 0);
+                m.Protect
+            }
+        }
+    }
+    impl Drop for Pages {
+        fn drop(&mut self) {
+            // SAFETY: allocated in `new`.
+            unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    fn at(rip: usize) -> CONTEXT {
+        // SAFETY: a zeroed context is valid.
+        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+        ctx.Rip = rip as u64;
+        ctx
+    }
+
+    /// Threads that fault on one `clwb` at once, some after another has patched it: all go on
+    /// behind it, the instruction becomes one NOP, and its page keeps its protection.
+    #[test]
+    fn threads_that_meet_at_a_clwb_all_go_on() {
+        // [r9+0x40], over a cache line's end in its page.
+        const CLWB: [u8; 6] = [0x66, 0x41, 0x0F, 0xAE, 0x71, 0x40];
+        const AT: usize = 64 - 3;
+        for _ in 0..200 {
+            let mut code = Pages::new(0x1000);
+            code.bytes().fill(0xCC);
+            code.bytes()[AT..AT + CLWB.len()].copy_from_slice(&CLWB);
+            code.protect(0, 0x1000, PAGE_EXECUTE_READ);
+            let rip = code.0 + AT;
+            let gate = std::sync::Barrier::new(8);
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    s.spawn(|| {
+                        gate.wait();
+                        for _ in 0..4 {
+                            let mut ctx = at(rip);
+                            // SAFETY: the context of a fault at our code.
+                            assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+                            assert_eq!(ctx.Rip as usize, rip + CLWB.len());
+                        }
+                    });
+                }
+            });
+            assert_eq!(code.protection(), PAGE_EXECUTE_READ);
+            let mut nop = CLWB;
+            nop[3] = decode::NOP_OPCODE;
+            assert_eq!(&code.bytes()[AT..AT + nop.len()], &nop);
+        }
+    }
+
+    /// On a thread of its own, which remembers no memory of other tests ([`WRITABLE`]).
+    fn on_a_thread(test: impl FnOnce() + Send) {
+        std::thread::scope(|s| s.spawn(test).join().unwrap());
+    }
+
+    /// `clzero; add rax,40h; cmp rax,rdx; jb` run from the fault on.
+    const LOOP: [u8; 12] = [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4];
+
+    fn run_loop(start: usize, end: usize) -> (i32, CONTEXT, usize) {
+        let code = LOOP;
+        let rip = code.as_ptr() as usize;
+        let mut ctx = at(rip);
+        ctx.Rax = start as u64;
+        ctx.Rdx = end as u64;
+        ctx.EFlags = 0x202;
+        // SAFETY: the context of a fault at `code`; the loop's memory is the caller's.
+        let r = unsafe { emulate(&mut ctx) };
+        let moved = ctx.Rip as usize - rip;
+        (r, ctx, moved)
+    }
+
+    /// Memory, `rax` and the flags are as the loop's own instructions leave them, also for a
+    /// `rax` inside a line, an end inside one, and an end at or before the start.
+    #[test]
+    fn clzero_loops_leave_what_the_instructions_leave() {
+        on_a_thread(|| {
+            for (start, end) in [(0, 0x1000), (64, 65), (5, 200), (0x100, 0x100), (0x100, 0x40), (0x47, 0x80), (0x47, 0x88)] {
+                let mut data = Pages::new(0x3000);
+                data.bytes().fill(0xEE);
+                let base = data.0 + 0x1000;
+                let (r, ctx, moved) = run_loop(base + start, base + end);
+                assert_eq!((r, moved), (CONTINUE_EXECUTION, LOOP.len()), "{start:#x}..{end:#x}");
+                let (mut rax, mut expected) = (start, vec![0xEE; 0x3000]);
+                loop {
+                    let line = 0x1000 + (rax & !63);
+                    expected[line..line + 64].fill(0);
+                    rax += 64;
+                    if rax >= end {
+                        break;
+                    }
+                }
+                assert!(data.bytes() == &expected[..], "{start:#x}..{end:#x}");
+                assert_eq!(ctx.Rax as usize, base + rax);
+                let flags = crate::crash::cmp_flags((base + rax) as u64, (base + end) as u64);
+                assert_eq!(ctx.EFlags, 0x202 & !crate::crash::CMP_FLAGS | flags);
+                assert_eq!(ctx.EFlags & 1, 0, "jb is not taken");
+            }
+        });
+    }
+
+    /// The loop stops at a line it cannot write, with `rax` there and the loop to go on; at
+    /// the first line it is not emulated at all.
+    #[test]
+    fn a_clzero_loop_stops_at_memory_it_cannot_write() {
+        on_a_thread(|| {
+            let mut data = Pages::new(0x3000);
+            data.bytes().fill(0xEE);
+            data.protect(0x1000, 0x1000, PAGE_READONLY);
+            let (r, ctx, moved) = run_loop(data.0 + 0x800 + 5, data.0 + 0x2800);
+            assert_eq!((r, moved), (CONTINUE_EXECUTION, 0));
+            assert_eq!(ctx.Rax as usize, data.0 + 0x1000 + 5);
+            assert!(data.bytes()[0x800..0x1000].iter().all(|&b| b == 0));
+            assert!(data.bytes()[0x1000..].iter().all(|&b| b == 0xEE));
+            let (r, ctx, moved) = run_loop(data.0 + 0x1000, data.0 + 0x2800);
+            assert_eq!((r, moved, ctx.Rax as usize), (0, 0, data.0 + 0x1000));
+            // An end that is no address: what can be written is, and no more.
+            let (r, ctx, _) = run_loop(data.0 + 0x2000, usize::MAX);
+            assert_eq!(r, CONTINUE_EXECUTION);
+            assert_eq!(ctx.Rax as usize, data.0 + 0x3000, "the rest of its 64 KiB is free");
+            assert!(data.bytes()[0x2000..].iter().all(|&b| b == 0));
+        });
+    }
 }
