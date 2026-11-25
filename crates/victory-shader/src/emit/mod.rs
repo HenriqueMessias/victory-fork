@@ -110,13 +110,30 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::set_host_max_wave;
+pub use lower::{host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit, view_heap_limit,
 };
+
+/// The environment switches whose values change what a shader translates to
+/// (or whether it does) and that no function here gives the value of: the
+/// shader cache keys on each (`victory-gpu`'s does). A test lists every
+/// switch this crate reads, so that a new one is put here or said not to
+/// matter.
+pub const SWITCHES: &[&str] = &[
+    "VICTORY_WAVE_WIDE",
+    "VICTORY_WAVE_DEEP_SKIPS",
+    "VICTORY_WAVE_OWN_BITS",
+    "VICTORY_WAVE_LOCAL",
+    "VICTORY_F16_NEAREST",
+    "VICTORY_FIRST_HALF",
+    "VICTORY_FIRSTLANE_OWN",
+    "VICTORY_STRICT_JOINS",
+    "VICTORY_MESH_OUTPUT_STRICT",
+];
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -759,6 +776,51 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// Every environment switch this crate's source names is keyed by the
+    /// shader cache or known not to change a translation. (Five that did
+    /// were not keyed: a run was served what a run without them had cached.)
+    #[test]
+    fn every_switch_is_keyed_or_changes_no_translation() {
+        // The cache keys on what `loop_limit`, `group_sync` and `shader_opt` say.
+        const BY_VALUE: &[&str] = &["VICTORY_SHADER_LOOP_LIMIT", "VICTORY_GROUP_SYNC", "VICTORY_SHADER_OPT"];
+        // Messages and counts, tools, and what only tests read.
+        const NO_CHANGE: &[&str] = &[
+            "VICTORY_WAVE_WHY",
+            "VICTORY_DESC_WHY",
+            "VICTORY_SHADER_CENSUS",
+            "VICTORY_EMIT_DUMP",
+            "VICTORY_DXIL",
+            "VICTORY_WARP",
+            "VICTORY_D3D12_DEBUG",
+            "VICTORY_CONSOLE_DXC",
+            "VICTORY_PC_DXC",
+            "VICTORY_DIFF_ONLY",
+            "VICTORY_REF_VS",
+            "VICTORY_REF_PS",
+        ];
+        fn read(dir: &std::path::Path, out: &mut std::collections::BTreeSet<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    read(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    // A switch is read by its name, a string of its own.
+                    for part in std::fs::read_to_string(&path).unwrap().split('"') {
+                        let name = part.strip_prefix("VICTORY_").unwrap_or_default();
+                        if !name.is_empty() && name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') {
+                            out.insert(part.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        let mut named = std::collections::BTreeSet::new();
+        read(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut named);
+        let known: Vec<&str> = [super::SWITCHES, BY_VALUE, NO_CHANGE].concat();
+        let unknown: Vec<&String> = named.iter().filter(|n| !known.contains(&n.as_str())).collect();
+        assert!(unknown.is_empty(), "neither keyed nor said to change nothing: {unknown:?}");
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {

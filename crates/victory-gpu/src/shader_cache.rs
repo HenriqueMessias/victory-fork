@@ -58,18 +58,18 @@ fn build() -> &'static [u8; 32] {
                 // a translation cached without the clamp must not be served.
                 crate::descriptor::host::probe_view_limit();
                 bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
+                // And the host GPU's widest wave, known since the probe made
+                // the host: a wave64 program has other forms on a GPU that
+                // runs 32 lanes at most, so a cache folder that saw another
+                // GPU (or the software adapter) must not serve its own.
+                bytes.extend_from_slice(&victory_shader::emit::host_max_wave().to_le_bytes());
                 // Which group barriers wait is part of the translation too.
                 bytes.push(victory_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VICTORY_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
-                for name in [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                ] {
+                // So are the translator's switches: without them here a run
+                // with `VICTORY_WAVE_WIDE=0` was served the translations an
+                // earlier run of the same executable had cached with the
+                // switch unset.
+                for name in victory_shader::emit::SWITCHES {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
                     if let Some(value) = std::env::var_os(name) {
